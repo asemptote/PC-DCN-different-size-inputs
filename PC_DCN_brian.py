@@ -7,8 +7,6 @@ import brian2 as br
 
 #import functions
 
-
-
 plot_dims = (6,6)
 def subplot(newplot=False):
     global plot_counter
@@ -18,6 +16,10 @@ def subplot(newplot=False):
 
 def execfn(*args):
     exec(' '.join(args))
+    
+def echo(expr):
+    print(expr)
+    return expr
 
 from functools import partial
 
@@ -28,26 +30,115 @@ def apply_kwargs(f, kwargs):
     return f(**kwargs)
 
 
+def fig2_fitted(**kwargs):
+    '''
+    Use as e.g.
+        python PC_DCN_brian.py execfn fig2_fitted(T=10*br.second, N_DCN=10, N_extE_DCN=30000, fix_gI_ylim=False)
+        python PC_DCN_brian.py execfn fig2_fitted(T=10*br.second, N_DCN=10, N_extE_DCN=30000, fix_gI_ylim=False, dist=scipy.stats.pareto)
+    '''
+    import functions
+    G = np.genfromtxt('G.csv')  # nS
+    
+    plt.figure(figsize=(10,10))
+    global plot_dims
+    plot_dims = (6,6)
+    ax = subplot(newplot=True)
+    
+    dist = kwargs.get('dist', scipy.stats.lognorm)
+    
+    param = functions.plot_fit(ax, G, dist)
+    plt.title(dist.name)
+    plt.xlabel('size (nS)')
+    
+    kwargs['input_sizes'] = np.sort(dist(*param).rvs(30))*br.nS
+    kwargs['neuronpartition'] = range(29)
+    kwargs['newfig'] = False
+    if 'N_extE_DCN' not in kwargs: kwargs['N_extE_DCN'] = 30000
+    
+    ax = subplot()
+    fig2(**kwargs)
 
-def fig2():
-    pass    
-
-def get_fig4(T_second=1):
-    T = float(T_second)*br.second
-    from multiprocessing import Pool
-    params = [[400, -0.05*br.mV],
-              [80, -0.25*br.mV],
-              [40, -0.5*br.mV],
-              [20, -1*br.mV],
-              [10, -2*br.mV],
-              [5, -4*br.mV]]
-    paramsets = [dict(zip(['N_PC', 'J_PC'], val),
-                      T=T, ISI_xlim_ms=[0, 150], input_ylim_mV_s=[0, 4000]
-                      ) for val in params]
-    print(paramsets)
-    with Pool(min(len(params), 16)) as p:
-        starstarmap(p, fig4, paramsets)
-
+def fig2(**kwargs):
+    '''
+    pass in all the input sizes and measure the cross correlation for each
+    spike size
+    '''
+    input_sizes = kwargs.get('input_sizes', 
+                             np.concatenate([np.repeat(3, 16),
+                                             np.repeat(10, 10),
+                                             np.repeat(30, 2)])*br.nS)
+    N_inputs = len(input_sizes)
+    if 'N_DCN' not in kwargs: kwargs['N_DCN'] = 1
+    kwargs['N_PC'] = N_inputs * kwargs['N_DCN']
+    kwargs['connect'] = {'i': [], 'j': []}
+    kwargs['w'] = []
+    for j_DCN in range(kwargs['N_DCN']):
+        kwargs['connect']['i'].extend(range(N_inputs*j_DCN, N_inputs*(j_DCN+1)))
+        kwargs['connect']['j'].extend([j_DCN for _ in input_sizes])
+        kwargs['w'].extend(input_sizes)
+    
+    # kwargs['connect'] = {'i': range(len(input_sizes)), 'j': 0}
+    # kwargs['w'] = input_sizes
+    # kwargs['N_DCN'] = 1
+    # kwargs['N_PC'] = len(input_sizes)
+    if 'N_extE_DCN' not in kwargs: kwargs['N_extE_DCN'] = 5000
+    
+    net = run_DCN_conductance(**kwargs)
+    
+    timefilter = net.t - net['st_DCN'].t < 200*br.ms
+    
+    neuronpartition = kwargs.get('neuronpartition', [0,16,26])
+    n_subplots = len(neuronpartition) + 2
+    
+    if kwargs.get('newfig', True):
+        plt.figure(figsize=(10,10))
+        global plot_dims
+        plot_dims = (int(np.ceil(n_subplots**0.5)),int(np.floor(n_subplots**0.5)))
+        ax = subplot(newplot=True)
+    
+    DCN_neuronindex = 0
+    
+    # plot the total inhibitory conductance
+    plt.plot(net['st_DCN'].t[timefilter]/br.second, net['st_DCN'].gI[DCN_neuronindex][timefilter]/br.nS)
+    plt.xlabel('time (s)')
+    plt.ylabel('I conductance (nS)')
+    #plt.title(f'{N_inputs_list[neuronindex]} x {input_sizes[neuronindex]/br.nS}nS')
+    if kwargs.get('fix_gI_ylim', True): plt.ylim([0, 100])
+    
+    ax = subplot()   
+    
+    # plot the V trace of the DCN neuron
+    plt.plot(net['st_DCN'].t[timefilter]/br.second, net['st_DCN'].v[DCN_neuronindex][timefilter]/br.mV)
+    for t in net['sp_DCN'].spike_trains()[DCN_neuronindex]:
+        if net.t - t < 200*br.ms: plt.axvline(t/br.second, 0, 100, c='black')
+    plt.title(f"mean DCN rate = {len(net['sp_DCN'].spike_trains()[DCN_neuronindex])/net.t}")
+    plt.xlabel('time (s)')
+    plt.ylabel('V (mV)')
+    plt.ylim([-75, 0])
+    
+    
+    
+    for i in range(len(neuronpartition)):
+        ax = subplot()
+        # plot the PC spike triggered average DCN firing rate 
+        #hist, bins = STA_rate(ax, net, neuronindex)
+        hist_list, bins_list = zip(*[spike_crosscorrelogram(
+            np.concatenate([net['sp_PC'].spike_trains()[PC_neuronindex]
+                            for PC_neuronindex in range(N_inputs*j_DCN+neuronpartition[i],
+                                                        N_inputs*j_DCN+(neuronpartition[i+1] if i<=len(neuronpartition)-2 else N_inputs))] or [[]]),
+            net['sp_DCN'].spike_trains()[j_DCN]
+            ) for j_DCN in range(kwargs['N_DCN'])])
+        hist = np.sum(hist_list, axis=0)
+        bins = bins_list[0]
+        ax.stairs(hist/(hist[0] or 1), bins/br.ms)
+        #plt.title(f"N_PC = {len(net['PC'])} \n T = {net.t}")
+        plt.title(f'{input_sizes[neuronpartition[i]]/br.nS:.3g} nS')
+        plt.ylabel('spikes (norm.)')
+        plt.xlabel('t (ms)')
+        plt.ylim([0,2])
+    
+    if kwargs.get('net', False): return net
+    else: plt.show()
 
 
 def fig4(**kwargs):
@@ -80,24 +171,11 @@ def fig4(**kwargs):
     net = run_DCN_conductance(**kwargs)
     
     neuronindices = kwargs.get('neuronindices', [N_inputs_list.index(N_inputs) for N_inputs in [0, 80, 40, 20, 10, 5]])
-    if kwargs.get('parallel', False):
-        from multiprocessing import Pool
-        with Pool(1) as p:
-            STA_rates = dict(zip(neuronindices,
-                                 p.map(partial(STA_rate,
-                                               np.array(net['S'].i),
-                                               np.array(net['S'].j),
-                                               net['sp_PC'].spike_trains(),
-                                               net['sp_DCN'].spike_trains()),
-                                       neuronindices)))
-    else:
-        STA_rates = dict(zip(neuronindices,
-                             map(partial(STA_rate,
-                                           np.array(net['S'].i),
-                                           np.array(net['S'].j),
-                                           net['sp_PC'].spike_trains(),
-                                           net['sp_DCN'].spike_trains()),
-                                   neuronindices)))
+    STA_rates = {DCN_neuronindex: spike_crosscorrelogram(
+        np.concatenate([net['sp_PC'].spike_trains()[PC_neuronindex]
+                        for PC_neuronindex in np.array(net['S'].i)[np.array(net['S'].j)==DCN_neuronindex]] or [[]]),
+        net['sp_DCN'].spike_trains()[DCN_neuronindex])
+        for DCN_neuronindex in neuronindices}
     
     lastsecondfilter = net.t - net['st_DCN'].t < br.second
     
@@ -110,7 +188,7 @@ def fig4(**kwargs):
         # plot the total inhibitory conductance
         plt.plot(net['st_DCN'].t[lastsecondfilter]/br.second, net['st_DCN'].gI[neuronindex][lastsecondfilter]/br.nS)
         plt.xlabel('time (s)')
-        plt.ylabel('I conductance (nS)')
+        plt.ylabel('gI (nS)')
         plt.title(f'{N_inputs_list[neuronindex]} x {input_sizes[neuronindex]/br.nS}nS')
         plt.ylim([0, 140])
         
@@ -128,9 +206,9 @@ def fig4(**kwargs):
         # plot the PC spike triggered average DCN firing rate 
         #hist, bins = STA_rate(ax, net, neuronindex)
         hist, bins = STA_rates[neuronindex]
-        ax.stairs(hist, bins/br.ms)
+        ax.stairs(hist/(hist[0] or 1), bins/br.ms)
         #plt.title(f"N_PC = {len(net['PC'])} \n T = {net.t}")
-        plt.ylabel('spike-triggered output rate')
+        plt.ylabel('spikes (norm.)')
         plt.xlabel('t (ms)')
         
         # plot the ISI distribution of the DCN
@@ -180,38 +258,14 @@ def fig4(**kwargs):
     
     if kwargs.get('net', False): return net
     else: plt.show()
-
-def STA_rate(S_i, S_j, PC_sp_tr_dict, DCN_sp_tr_dict, DCN_neuronindex=0, window=9.9*br.ms):
-    '''
-    S_i = np.array(net['S'].i)
-    S_j = np.array(net['S'].j)
-    PC_sp_tr_dict = net['sp_PC'].spike_trains()
-    DCN_sp_tr_dict = net['sp_DCN'].spike_trains()
-    '''
-    # for DCN_neuronindex in range(len(net['DCN'])):
-    PC_neuronindices = np.array(S_i)[np.array(S_j)==DCN_neuronindex]
-    bins = np.linspace(-window, window, 100)
-    hist = np.zeros(len(bins)-1, dtype='int32')
-    DCN_sp_tr = DCN_sp_tr_dict[DCN_neuronindex]
-    for PC_neuronindex in tqdm(PC_neuronindices):
-        for sp_t in PC_sp_tr_dict[PC_neuronindex]:
-            hist += np.histogram(DCN_sp_tr, bins + sp_t)[0]
-            #print(hist)
-    return hist, bins
-
-
-
-def generate_PC_spikes(ISI_dist, ISI_dist_unit, N_PC, T, startindex=0, chunk=100):
-    ISIs = ISI_dist.rvs(size=[N_PC, chunk])
-    while min(np.sum(ISIs, axis=1)) * ISI_dist_unit < T:
-        ISIs = np.concatenate((ISIs, ISI_dist.rvs(size=[N_PC, chunk])), axis=1)
-    PC_times = np.cumsum(ISIs, axis=1).flatten() * ISI_dist_unit
-    PC_indices = np.full_like(ISIs.T, range(startindex, startindex+N_PC), dtype=int).T.flatten()
-    # sort
-    PC_indices = np.take_along_axis(PC_indices, np.argsort(PC_times), axis=0)
-    PC_times = np.sort(PC_times)
-    return PC_indices, PC_times
     
+def spike_crosscorrelogram(in_ts, out_ts, window=10*br.ms):
+    in_ts_ms = np.array(in_ts/br.ms)
+    out_ts_ms = np.array(out_ts/br.ms)
+    window_ms = window/br.ms
+    shiftedtimes = np.concatenate([out_t-in_ts_ms[abs(in_ts_ms-out_t)<window_ms]
+                                   for out_t in out_ts_ms] or [[]]) * br.ms
+    return np.histogram(shiftedtimes, np.linspace(-window, window, 100))
 
 def fig5(**kwargs):
     '''
@@ -224,13 +278,15 @@ def fig5(**kwargs):
         N_factors (rates of small inputs varied) + N_factors (medium) + N_factors (large)
     '''
     
-    N_factors = kwargs.get('N_factors', 5)  # should be an odd number
+    factor_list = kwargs.get('factor_list', np.linspace(0, 2, kwargs.get('N_factors', 5)))
+    N_factors = len(factor_list)  # should be an odd number
+    unity_factorindex = list(factor_list).index(1)
     
     # Use as PC_indexmap[factor, size_index], returns list
-    PC_indexmap = [[range(28*factor + N_offset, 28*factor + N_offset + N_size)
+    # this gives the indices of the PCs which project onto
+    PC_indexmap = [[range(28*j_factor + N_offset, 28*j_factor + N_offset + N_size)
                     for N_size, N_offset in [(16, 0), (10, 16), (2, 26)]]
-                   for factor in range(N_factors)]
-    # print(PC_indexmap)
+                   for j_factor in range(N_factors)]
     
     connect = {'i': [], 'j': []}
     w = []
@@ -240,7 +296,7 @@ def fig5(**kwargs):
             for i_size, size in enumerate([3, 10, 30]*br.nS):
                 i_iter = (PC_indexmap[j_factor][j_size] 
                           if i_size == j_size
-                          else PC_indexmap[int((N_factors-1)/2)][i_size])
+                          else PC_indexmap[unity_factorindex][i_size])
                 connect['i'].extend(i_iter)
                 connect['j'].extend([j for _ in range(len(i_iter))])
                 w.extend([size for _ in range(len(i_iter))])
@@ -248,13 +304,14 @@ def fig5(**kwargs):
     kwargs['N_PC'] = (16+10+2)*N_factors
     kwargs['N_DCN'] = 3*N_factors
     kwargs['w'] = w
+    if 'N_extE_DCN' not in kwargs: kwargs['N_extE_DCN'] = 4000
     
     kwargs['connect'] = connect
     
     if 'T' not in kwargs: kwargs['T'] = 1*br.second
     PC_indices = []
     PC_times = []
-    for i, factor in enumerate(np.linspace(0, 2, N_factors)):
+    for i, factor in enumerate(factor_list):
         if factor == 0: continue
         PC_indices_part, PC_times_part = fitted_PC_spikes(28, kwargs['T'], 28*i, 1/(factor*80*br.Hz))
         PC_indices.extend(PC_indices_part)
@@ -270,15 +327,53 @@ def fig5(**kwargs):
     gI = net['st_DCN'].gI
     gI_CV = np.std(gI, axis=1) / np.mean(gI, axis=1)
     
+    plt.figure(figsize=(10,10))
+    global plot_dims
+    plot_dims = (2,3)
+    ax = subplot(newplot=True)
+    
     # ax = subplot(newplot=True)
-    # plot firing rate vs input rate
+    # plot firing rate vs input rate of varied cells
+    firing_rate = [len(tr)/net.t for tr in net['sp_DCN'].spike_trains().values()]
+    input_rate = [factor*80*br.Hz for j_size in range(3) for factor in factor_list]
+    plt.plot(np.reshape(input_rate, [3,N_factors]).T, np.reshape(firing_rate, [3,N_factors]).T, 'o-')
+    plt.legend(['small', 'medium', 'large'])
+    plt.xlim([0, 160])
+    plt.ylim([0, 200])
+    plt.xlabel('input rate (Hz)')
+    plt.ylabel('DCN rate (Hz)')
+    
+    ax = subplot()
+    
+    # plot firing rate against gI mean
+    plt.plot(np.reshape(np.mean(gI, axis=1)/br.nS, [3,N_factors]).T, np.reshape(firing_rate, [3,N_factors]).T, 'o-')
+    plt.legend(['small', 'medium', 'large'])
+    plt.xlim([20, 80])
+    plt.ylim([0, 200])
+    plt.xlabel('gI mean (nS)')
+    plt.ylabel('DCN rate (Hz)')
+    
+    ax = subplot()
     
     # plot firing rate against gI CV
-    firing_rate = [len(tr)/net.t for tr in net['sp_DCN'].spike_trains().values()]
     plt.plot(np.reshape(gI_CV, [3,N_factors]).T, np.reshape(firing_rate, [3,N_factors]).T, 'o-')
     plt.legend(['small', 'medium', 'large'])
     plt.xlim([0, 0.5])
     plt.ylim([0, 200])
+    plt.xlabel('gI CV')
+    plt.ylabel('DCN rate (Hz)')
+    
+    ax = subplot()
+    
+    # plot firing rate against gI std
+    plt.plot(np.reshape(np.std(gI, axis=1)/br.nS, [3,N_factors]).T, np.reshape(firing_rate, [3,N_factors]).T, 'o-')
+    plt.legend(['small', 'medium', 'large'])
+    # plt.xlim([20, 80])
+    # plt.ylim([0, 200])
+    plt.xlabel('gI std (nS)')
+    plt.ylabel('DCN rate (Hz)')
+    
+    plt.tight_layout()
     
     if kwargs.get('net', False): return net
     else: plt.show()
@@ -294,6 +389,16 @@ def fitted_PC_spikes(N_PC, T, startindex=0, mean_PC_ISI=1/(80*br.Hz)):
     dist_PC_ISI = scipy.stats.lognorm(s=sigma_lognorm, scale=exp_mu_lognorm/dist_PC_ISI_unit)
     return generate_PC_spikes(dist_PC_ISI, dist_PC_ISI_unit, N_PC, T, startindex)
 
+def generate_PC_spikes(ISI_dist, ISI_dist_unit, N_PC, T, startindex=0, chunk=100):
+    ISIs = ISI_dist.rvs(size=[N_PC, chunk])
+    while min(np.sum(ISIs, axis=1)) * ISI_dist_unit < T:
+        ISIs = np.concatenate((ISIs, ISI_dist.rvs(size=[N_PC, chunk])), axis=1)
+    PC_times = np.cumsum(ISIs, axis=1).flatten() * ISI_dist_unit
+    PC_indices = np.full_like(ISIs.T, range(startindex, startindex+N_PC), dtype=int).T.flatten()
+    # sort
+    PC_indices = np.take_along_axis(PC_indices, np.argsort(PC_times), axis=0)
+    PC_times = np.sort(PC_times)
+    return PC_indices, PC_times
 
 def run_DCN_conductance(**kwargs):    
     T = kwargs.get('T', 1*br.second)
